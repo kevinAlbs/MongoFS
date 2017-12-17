@@ -10,19 +10,24 @@
 
 #define FUSE_USE_VERSION 26
 
-#include <fuse.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
 
+#include <fuse.h>
 #include <mongoc.h>
 
+// fuse may run in multi-threaded mode.
+// TODO: I may need to (a) enforce single threaded or (b) use client_pool
 mongoc_client_t* client;
 #define FUSE_USE_VERSION 26
 
 static const char *hello_str = "Hello World!\n";
 static const char *hello_path = "/huh";
+
+// number of documents to be shown in a directory. -1 for all
+static int batch_size = 1000;
 
 static int hello_getattr(const char *path, struct stat *stbuf)
 {
@@ -40,38 +45,74 @@ static int hello_getattr(const char *path, struct stat *stbuf)
    return res;
 }
 
-static int hello_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-                         off_t offset, struct fuse_file_info *fi)
+static int mongofs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+                           off_t offset, struct fuse_file_info *fi)
 {
-   (void) offset;
-   (void) fi;
-
-   if (strcmp(path, "/") != 0)
-      return -ENOENT;
+   // TODO: why?
+   // (void) offset;
+   // (void) fi;
 
    filler(buf, ".", NULL, 0);
    filler(buf, "..", NULL, 0);
 
    const bson_t* doc;
    bson_t empty = BSON_INITIALIZER;
-   mongoc_collection_t* coll = mongoc_client_get_collection (client, "test", "coll");
-   mongoc_cursor_t* cursor = mongoc_collection_find_with_opts(coll, &empty, &empty, NULL);
 
+   int exit_status = 0; // the error code the function returns with
+   int skip = 0;
+
+   // parse path to see how many "it" directories down we are.
+   const char* path_iter = path;
+   while (strcmp(path_iter, "/it") == 0) {
+      path_iter += 3;
+      skip++;
+   }
+
+   // TODO: confirm, but I believe we should always have a trailing slash.
+   if (strcmp(path_iter, "/") != 0)
+      return -ENOENT;   
+
+   bson_t* opts = BCON_NEW(
+      "skip", BCON_INT64(skip),
+      "limit", BCON_INT32(batch_size),
+      "projection", "{", "_id", BCON_INT32(1), "}");
+
+   mongoc_collection_t* coll = mongoc_client_get_collection (client, "test", "coll");
+   mongoc_cursor_t* cursor = mongoc_collection_find_with_opts(coll, &empty, opts, NULL /* read pref */);
+
+   bson_free(opts);
+   
    while (mongoc_cursor_next(cursor, &doc)) {
       bson_iter_t iter;
       if (bson_iter_init_find(&iter, doc, "_id")) {
          const bson_oid_t *oid = bson_iter_oid (&iter);
          bson_t tmp = BSON_INITIALIZER;
          bson_append_oid(&tmp, "", 0, oid);
+         // TODO: see if there is a better way to get object id as a string.
          char* asStr = bson_as_json(&tmp, 0);
          asStr[19 + 24] = '\0';
-         filler(buf, asStr + 19, NULL, 0);
+         // TODO: filler may return 1 if buf is full. Instead, change this to use the offset form
+         // of readdir so filled buffer won't break.
+         int ret = filler(buf, asStr + 19, NULL, 0);
          bson_free(asStr);
+         if (ret != 0) {
+            exit_status = -EIO;
+            goto cleanup;
+         }
       }
    }
 
+   bson_error_t err;
+   if (mongoc_cursor_error(&cursor, &err)) {
+      exit_status = -EIO;
+      goto cleanup;
+   }
 
-   return 0;
+cleanup:
+   mongoc_cursor_destroy(&cursor);
+   mongoc_collection_destroy(coll);
+
+   return exit_status;
 }
 
 static int hello_open(const char *path, struct fuse_file_info *fi)
@@ -104,9 +145,9 @@ static int hello_read(const char *path, char *buf, size_t size, off_t offset,
    return size;
 }
 
-static struct fuse_operations hello_oper = {
+static struct fuse_operations mongofs_oper = {
    .getattr	= hello_getattr,
-   .readdir	= hello_readdir,
+   .readdir	= mongofs_readdir,
    .open		= hello_open,
    .read		= hello_read,
 };
@@ -115,6 +156,5 @@ int main(int argc, char *argv[])
 {
    mongoc_init();
    client = mongoc_client_new("mongodb://localhost:27017");
-
-   return fuse_main(argc, argv, &hello_oper, NULL);
+   return fuse_main(argc, argv, &mongofs_oper, NULL);
 }
