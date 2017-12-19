@@ -63,7 +63,7 @@ static int mongofs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
    // parse path to see how many "it" directories down we are.
    const char* path_iter = path;
-   while (strcmp(path_iter, "/it") == 0) {
+   while (strstr(path_iter, "/it") != NULL) {
       path_iter += 3;
       skip++;
    }
@@ -73,7 +73,7 @@ static int mongofs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
       return -ENOENT;   
 
    bson_t* opts = BCON_NEW(
-      "skip", BCON_INT64(skip),
+      "skip", BCON_INT64(skip * batch_size),
       "limit", BCON_INT32(batch_size),
       "projection", "{", "_id", BCON_INT32(1), "}");
 
@@ -103,13 +103,13 @@ static int mongofs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
    }
 
    bson_error_t err;
-   if (mongoc_cursor_error(&cursor, &err)) {
+   if (mongoc_cursor_error(cursor, &err)) {
       exit_status = -EIO;
       goto cleanup;
    }
 
 cleanup:
-   mongoc_cursor_destroy(&cursor);
+   mongoc_cursor_destroy(cursor);
    mongoc_collection_destroy(coll);
 
    return exit_status;
@@ -126,35 +126,90 @@ static int hello_open(const char *path, struct fuse_file_info *fi)
    return 0;
 }
 
-static int hello_read(const char *path, char *buf, size_t size, off_t offset,
+// this queries *every* time a read is issued.
+// instead, we should cache at least the most recently read document.
+static int mongofs_read(const char *path, char *buf, size_t size, off_t offset,
                       struct fuse_file_info *fi)
 {
-   size_t len;
    (void) fi;
-   //if(strcmp(path, hello_path) != 0)
-    //  return -ENOENT;
+   int exit_status;
+   // path should be of the form /it/it/it/....<id>
+   const char* path_iter = path;
+   while (strstr(path_iter, "/it") != NULL) {
+      path_iter += 3;
+   }
 
-   len = strlen(hello_str);
-   if (offset < len) {
-      if (offset + size > len)
-         size = len - offset;
-      memcpy(buf, hello_str + offset, size);
-   } else
-      size = 0;
+   if (strlen(path_iter) != 1 + 24) {
+      printf("malformed read, expecting file to be /<24 chars>\n");
+      return -ENOENT;
+   }
 
-   return size;
+   ++path_iter; // skip slash
+
+   if (!bson_oid_is_valid(path_iter, 24)) {
+      printf("malformed oid\n");
+      return -ENOENT;
+   }
+
+   bson_oid_t oid;
+   bson_oid_init_from_string (&oid, path_iter);
+
+   bson_t query;
+   bson_init(&query);
+   bson_append_oid(&query, "_id", 3, &oid);
+
+   bson_t opts;
+   bson_init(&opts);
+
+   mongoc_collection_t* coll = mongoc_client_get_collection (client, "test", "coll");
+   mongoc_cursor_t* cursor = mongoc_collection_find_with_opts (coll, &query, &opts, NULL);
+
+   bson_destroy (&query);
+   bson_destroy (&opts);
+
+   bson_error_t err;
+
+   const bson_t *out;
+   if (mongoc_cursor_next(cursor, &out)) {
+      // instead of copying, I could hack/write my own visitor to write in place.
+      int length;
+      char* doc_data = bson_as_json(out, &length);
+      int bytes_to_copy = size;
+      if (offset + size > length) {
+         // this is the last read.
+         bytes_to_copy = length - offset; // might be zero
+      }
+      memcpy(buf, doc_data + offset, bytes_to_copy);
+      return bytes_to_copy;
+   }
+   else if (mongoc_cursor_error(cursor, &err)) {
+      exit_status = -EIO;
+      goto cleanup;
+   }
+   else {
+      printf("doc with id %s not found\n", path_iter);
+      exit_status = -ENOENT;
+      goto cleanup;
+   }
+
+cleanup:
+   mongoc_collection_destroy(coll);
+   mongoc_cursor_destroy(cursor);
+   return exit_status;
 }
 
 static struct fuse_operations mongofs_oper = {
    .getattr	= hello_getattr,
    .readdir	= mongofs_readdir,
    .open		= hello_open,
-   .read		= hello_read,
+   .read		= mongofs_read,
 };
 
 int main(int argc, char *argv[])
 {
    mongoc_init();
    client = mongoc_client_new("mongodb://localhost:27017");
+
    return fuse_main(argc, argv, &mongofs_oper, NULL);
+
 }
