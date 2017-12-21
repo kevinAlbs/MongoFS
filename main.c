@@ -29,18 +29,32 @@ static const char *hello_path = "/huh";
 // number of documents to be shown in a directory. -1 for all
 static int batch_size = 1000;
 
-static int hello_getattr(const char *path, struct stat *stbuf)
+static int mongofs_getattr(const char *path, struct stat *stbuf)
 {
    int res = 0;
 
    memset(stbuf, 0, sizeof(struct stat));
-   if (strcmp(path, "/") == 0) {
+
+   bool is_dir = false;
+   const char* path_iter = path;
+   while (strstr(path_iter, "/it") != NULL) {
+      path_iter += 3;
+   }
+
+   if (strlen(path_iter) == 0 || path_iter[0] != '/')
+      return -ENOENT;
+
+   ++path_iter; // skip slash
+   is_dir = strlen(path_iter) == 0;
+
+   if (is_dir == 0) {
       stbuf->st_mode = S_IFDIR | 0755;
       stbuf->st_nlink = 2;
    } else {
       stbuf->st_mode = S_IFREG | 0444;
       stbuf->st_nlink = 1;
-      stbuf->st_size = strlen(hello_str);
+      // stbuf->st_size = strlen(hello_str); not sure if this matters for reading
+      stbuf->st_size = 0;
    }
    return res;
 }
@@ -69,7 +83,7 @@ static int mongofs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
    }
 
    // TODO: confirm, but I believe we should always have a trailing slash.
-   if (strcmp(path_iter, "/") != 0)
+   if (strlen(path_iter) == 0 || path_iter[0] != '/')
       return -ENOENT;   
 
    bson_t* opts = BCON_NEW(
@@ -115,14 +129,14 @@ cleanup:
    return exit_status;
 }
 
-static int hello_open(const char *path, struct fuse_file_info *fi)
+static int mongofs_open(const char *path, struct fuse_file_info *fi)
 {
-   //if (strcmp(path, hello_path) != 0)
-   //   return -ENOENT;
-
+   // see `man 2 open` for flags
    if ((fi->flags & 3) != O_RDONLY)
       return -EACCES;
 
+   // return a file descriptor.
+   // TODO: use fd to keep track of which bson_t's to cache in memory
    return 0;
 }
 
@@ -199,9 +213,9 @@ cleanup:
 }
 
 static struct fuse_operations mongofs_oper = {
-   .getattr	= hello_getattr,
+   .getattr	= mongofs_getattr,
    .readdir	= mongofs_readdir,
-   .open		= hello_open,
+   .open		= mongofs_open,
    .read		= mongofs_read,
 };
 
