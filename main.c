@@ -115,6 +115,71 @@ cleanup:
    return exit_status;
 }
 
+typedef struct {
+   bool free;
+   char* data;
+   int size;
+   char id[24];
+} cached_bson_t;
+
+cached_bson_t cache[100];
+
+void init_cache() {
+   for (int i = 0; i < 100; i++) {
+      cache[i] = (cached_bson_t){0};
+      cache[i].free = true;
+   }
+}
+
+int get_cached(char* id, bool add_if_not_found, cached_bson_t** out) {
+   MONGOFS_DEBUG("get_cached %s\n", id);
+
+   *out = NULL;
+
+   // check if id is in cache
+   int i;
+   for (i = 0; i < 100; i++) {
+      if (!cache[i].free && strncmp(cache[i].id, id, 24) == 0) {
+         *out = cache + i;
+         return 0;
+      }
+   }
+
+   // if user just wants cache entry only if it exists, then return NULL
+   if (!add_if_not_found) return 0;
+
+   // otherwise, add a new cache entry
+   for (i = 0; i < 100; i++) {
+      if (cache[i].free) break;
+   }
+
+   if (i == 100) {
+      MONGOFS_DEBUG("error, no free cache results");
+      return 0;
+   }
+
+   cache[i].free = false;
+   int exit_status  = get_bson_string(id, &cache[i].data, &cache[i].size);
+   strncpy(cache[i].id, id, 24);
+   if (exit_status != 0) return exit_status;
+   *out = cache + i;
+   return 0;
+}
+
+void remove_if_cached(char* id) {
+   MONGOFS_DEBUG("remove_cached %s\n", id);
+   // check if id is in cache
+   int i;
+   for (i = 0; i < 100; i++) {
+      if (!cache[i].free && strncmp(cache[i].id, id, 24) == 0) {
+         bson_free(cache[i].data);
+         cache[i].free = true;
+      }
+   }
+   // no-op.
+   MONGOFS_DEBUG(" no-op");
+}
+
 static int mongofs_getattr(const char *path, struct stat *stbuf)
 {
    MONGOFS_DEBUG("getattr %s \n", path);
@@ -131,14 +196,12 @@ static int mongofs_getattr(const char *path, struct stat *stbuf)
       stbuf->st_mode = S_IFDIR | 0755;
       stbuf->st_nlink = 2;
    } else {
-      char* doc_str = "";
-      int doc_str_len;
-      int exit_status = get_bson_string (parsed.id, &doc_str, &doc_str_len);
+      cached_bson_t* cached;
+      int exit_status = get_cached(parsed.id, true, &cached);
       if (exit_status != 0) return exit_status;
-      bson_free(doc_str);
       stbuf->st_mode = S_IFREG | 0666;
       stbuf->st_nlink = 1;
-      stbuf->st_size = doc_str_len;
+      stbuf->st_size = cached->size;
    }
 
    return 0;
@@ -245,24 +308,18 @@ static int mongofs_read(const char *path, char *buf, size_t size, off_t offset,
    // path should be of the form /it/it/it/....<id>
    parsed_path_t parsed = parse_path(path);
 
-   if (parsed.is_bad || !parsed.exists) {
-      return -ENOENT;
-   }
+   if (parsed.is_bad || !parsed.exists) return -ENOENT;
 
-   char* as_str;
-   int length;
-   int exit_status = get_bson_string(parsed.id, &as_str, &length);
-
-   if (exit_status != 0) {
-      return exit_status;
-   }
+   cached_bson_t* cached;
+   int exit_status = get_cached(parsed.id, true, &cached);
+   if (exit_status != 0) return exit_status;
 
    int bytes_to_copy = size;
-   if (offset + size > length) {
+   if (offset + size > cached->size) {
       // this is the last read.
-      bytes_to_copy = length - offset; // might be zero
+      bytes_to_copy = cached->size - offset; // might be zero
    }
-   memcpy(buf, as_str + offset, bytes_to_copy);
+   memcpy(buf, cached->data + offset, bytes_to_copy);
    return bytes_to_copy;
 }
 
@@ -273,17 +330,19 @@ static int mongofs_write(const char *path, const char* data, size_t size, off_t 
       return -ENOENT;
    }
 
-   char* as_str;
-   int length;
-   int exit_status = get_bson_string(parsed.id, &as_str, &length);
+   // update the in memory representation.
+   //char* as_str;
+   //int length;
+   //int exit_status = get_bson_string(parsed.id, &as_str, &length);
 
    MONGOFS_DEBUG("write called with data %s of size %zu", data, size);
 
    // replace the text using offset/size and rewrite
-
-   if (exit_status != 0) {
-      return exit_status;
-   }
+//
+//   if (exit_status != 0) {
+//      return exit_status;
+//   }
+   return 0;
 }
 
 static struct fuse_operations mongofs_oper = {
@@ -298,6 +357,7 @@ static struct fuse_operations mongofs_oper = {
 int main(int argc, char *argv[])
 {
    mongoc_init();
+   init_cache();
    client = mongoc_client_new("mongodb://localhost:27017");
    printf("testing before fuse_main\n");
    return fuse_main(argc, argv, &mongofs_oper, NULL);
