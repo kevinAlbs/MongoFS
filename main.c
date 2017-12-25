@@ -26,6 +26,16 @@ typedef struct {
    int skips;
 } parsed_path_t;
 
+#define MONGOFS_DEBUG(...) printf(__VA_ARGS__)
+
+// fuse may run in multi-threaded mode.
+// TODO: I may need to (a) enforce single threaded or (b) use client_pool
+mongoc_client_t* client;
+#define FUSE_USE_VERSION 26
+
+// number of documents to be shown in a directory. -1 for all
+static int batch_size = 1000;
+
 parsed_path_t parse_path(const char* path) {
    const char* path_iter = path;
    parsed_path_t parsed = {0};
@@ -56,15 +66,7 @@ parsed_path_t parse_path(const char* path) {
    return parsed;
 }
 
-// fuse may run in multi-threaded mode.
-// TODO: I may need to (a) enforce single threaded or (b) use client_pool
-mongoc_client_t* client;
-#define FUSE_USE_VERSION 26
-
-// number of documents to be shown in a directory. -1 for all
-static int batch_size = 1000;
-
-// must free
+// if this returns 0, then *out must be freed.
 int get_bson_string(const char* id, char** out, int* outlen) {
    int exit_status = 0;
    if (!bson_oid_is_valid(id, 24)) {
@@ -107,6 +109,7 @@ int get_bson_string(const char* id, char** out, int* outlen) {
    }
 
 cleanup:
+   if (exit_status != 0 && *out) bson_free(*out);
    mongoc_collection_destroy(coll);
    mongoc_cursor_destroy(cursor);
    return exit_status;
@@ -114,7 +117,7 @@ cleanup:
 
 static int mongofs_getattr(const char *path, struct stat *stbuf)
 {
-   printf("getattr %s \n", path);
+   MONGOFS_DEBUG("getattr %s \n", path);
    memset(stbuf, 0, sizeof(struct stat));
 
    parsed_path_t parsed = parse_path(path);
@@ -128,17 +131,14 @@ static int mongofs_getattr(const char *path, struct stat *stbuf)
       stbuf->st_mode = S_IFDIR | 0755;
       stbuf->st_nlink = 2;
    } else {
-      char* bson_str = "";
-      printf("what is the address of bson_str? %x\n", &bson_str);
-      int bson_str_len;
-      int exit_status = get_bson_string (parsed.id, &bson_str, &bson_str_len);
+      char* doc_str = "";
+      int doc_str_len;
+      int exit_status = get_bson_string (parsed.id, &doc_str, &doc_str_len);
       if (exit_status != 0) return exit_status;
-      stbuf->st_mode = S_IFREG | 0444;
+      bson_free(doc_str);
+      stbuf->st_mode = S_IFREG | 0666;
       stbuf->st_nlink = 1;
-      // stbuf->st_size = strlen(hello_str); not sure if this matters for reading
-      stbuf->st_size = bson_str_len; // `cat` will read based off of size.
-      bson_free(bson_str);
-      printf("done\n");
+      stbuf->st_size = doc_str_len;
    }
 
    return 0;
@@ -211,6 +211,11 @@ cleanup:
    return exit_status;
 }
 
+
+static int mongofs_truncate(const char *path, off_t offset) {
+   // TODO: ignore
+   return 0;
+}
 static int mongofs_open(const char *path, struct fuse_file_info *fi)
 {
    // see `man 2 open` for flags
@@ -220,11 +225,13 @@ static int mongofs_open(const char *path, struct fuse_file_info *fi)
    if (parsed.is_bad || !parsed.exists)
       return -ENOENT;
 
-   if ((fi->flags & 3) != O_RDONLY)
-      return -EACCES;
+   // Can open file for writing
+//   if ((fi->flags & 3) != O_RDONLY)
+//      return -EACCES;
 
    // return a file descriptor.
    // TODO: use fd to keep track of which bson_t's to cache in memory
+   fi->fh = 10;
    return 0;
 }
 
@@ -233,7 +240,7 @@ static int mongofs_open(const char *path, struct fuse_file_info *fi)
 static int mongofs_read(const char *path, char *buf, size_t size, off_t offset,
                       struct fuse_file_info *fi)
 {
-   printf("reading %s\n", path);
+   MONGOFS_DEBUG("reading %s\n", path);
    (void) fi;
    // path should be of the form /it/it/it/....<id>
    parsed_path_t parsed = parse_path(path);
@@ -259,11 +266,33 @@ static int mongofs_read(const char *path, char *buf, size_t size, off_t offset,
    return bytes_to_copy;
 }
 
+static int mongofs_write(const char *path, const char* data, size_t size, off_t offset, struct fuse_file_info_t* fi) {
+   MONGOFS_DEBUG("writing %s\n", path);
+   parsed_path_t parsed = parse_path(path);
+   if (parsed.is_bad || !parsed.exists) {
+      return -ENOENT;
+   }
+
+   char* as_str;
+   int length;
+   int exit_status = get_bson_string(parsed.id, &as_str, &length);
+
+   MONGOFS_DEBUG("write called with data %s of size %zu", data, size);
+
+   // replace the text using offset/size and rewrite
+
+   if (exit_status != 0) {
+      return exit_status;
+   }
+}
+
 static struct fuse_operations mongofs_oper = {
    .getattr	= mongofs_getattr,
    .readdir	= mongofs_readdir,
    .open		= mongofs_open,
    .read		= mongofs_read,
+   .truncate = mongofs_truncate,
+   .write = mongofs_write,
 };
 
 int main(int argc, char *argv[])
