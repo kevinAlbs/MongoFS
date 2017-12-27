@@ -117,6 +117,7 @@ cleanup:
 
 typedef struct {
    bool free;
+   bool dirty;
    char* data;
    int size;
    char id[24];
@@ -159,6 +160,7 @@ int get_cached(char* id, bool add_if_not_found, cached_bson_t** out) {
    }
 
    cache[i].free = false;
+   cache[i].dirty = false;
    int exit_status  = get_bson_string(id, &cache[i].data, &cache[i].size);
    strncpy(cache[i].id, id, 24);
    if (exit_status != 0) return exit_status;
@@ -276,7 +278,27 @@ cleanup:
 
 
 static int mongofs_truncate(const char *path, off_t offset) {
-   // TODO: ignore
+   MONGOFS_DEBUG("truncate %s", path);
+   parsed_path_t parsed = parse_path(path);
+
+   if (parsed.is_bad || !parsed.exists) return -ENOENT;
+
+   cached_bson_t* cached;
+   int exit_status = get_cached(parsed.id, true, &cached);
+   if (exit_status != 0) return exit_status;
+
+   cached->dirty = true;
+   cached->data = (char*)bson_realloc(cached->data, offset);
+
+   // `man 2 truncate`
+   // If the file size is smaller than length, the file is extended and filled with zeros to the indicated length
+   if (cached->size < offset) {
+      MONGOFS_DEBUG("need to increase data size");
+      // set everything from [cached->size, offset) to zero
+      memset(cached->data + cached->size, 0, offset - cached->size);
+   }
+
+   cached->size = offset;
    return 0;
 }
 static int mongofs_open(const char *path, struct fuse_file_info *fi)
@@ -330,6 +352,9 @@ static int mongofs_write(const char *path, const char* data, size_t size, off_t 
       return -ENOENT;
    }
 
+      // TODO
+   // check if we need to reallocate.
+
    // update the in memory representation.
    //char* as_str;
    //int length;
@@ -342,7 +367,25 @@ static int mongofs_write(const char *path, const char* data, size_t size, off_t 
 //   if (exit_status != 0) {
 //      return exit_status;
 //   }
-   return 0;
+   return size;
+}
+
+static int mongofs_release(const char* path, struct fuse_file_info_t* fi) {
+   MONGOFS_DEBUG("mongofs_release %s\n", path);
+   parsed_path_t parsed = parse_path(path);
+
+   if (parsed.is_bad || !parsed.exists) return -ENOENT;
+
+   cached_bson_t* cached;
+   int exit_status = get_cached(parsed.id, true, &cached);
+   if (exit_status != 0) return exit_status;
+
+   if (cached->dirty) {
+      // write to mongoc driver
+      MONGOFS_DEBUG("cached doc is dirty, attempting to write\n");
+   }
+
+   remove_if_cached(parsed.id);
 }
 
 static struct fuse_operations mongofs_oper = {
@@ -352,6 +395,7 @@ static struct fuse_operations mongofs_oper = {
    .read		= mongofs_read,
    .truncate = mongofs_truncate,
    .write = mongofs_write,
+   .release = mongofs_release
 };
 
 int main(int argc, char *argv[])
