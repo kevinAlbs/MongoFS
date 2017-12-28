@@ -96,7 +96,7 @@ int get_bson_string(const char* id, char** out, int* outlen) {
 
    const bson_t *out_doc;
    if (mongoc_cursor_next(cursor, &out_doc)) {
-      *out = bson_as_json(out_doc, (size_t*)outlen);
+      *out = bson_as_canonical_extended_json (out_doc, (size_t*)outlen);
    }
    else if (mongoc_cursor_error(cursor, &err)) {
       exit_status = -EIO;
@@ -352,21 +352,17 @@ static int mongofs_write(const char *path, const char* data, size_t size, off_t 
       return -ENOENT;
    }
 
-      // TODO
-   // check if we need to reallocate.
+   cached_bson_t* cached;
+   int exit_status = get_cached(parsed.id, true, &cached);
+   if (exit_status != 0) return exit_status;
 
-   // update the in memory representation.
-   //char* as_str;
-   //int length;
-   //int exit_status = get_bson_string(parsed.id, &as_str, &length);
+   if (offset + size > cached->size) {
+      cached->data = bson_realloc(cached->data, offset + size);
+      cached->size = offset + size;
+   }
 
-   MONGOFS_DEBUG("write called with data %s of size %zu", data, size);
+   memcpy(cached->data + offset, data, size);
 
-   // replace the text using offset/size and rewrite
-//
-//   if (exit_status != 0) {
-//      return exit_status;
-//   }
    return size;
 }
 
@@ -380,12 +376,37 @@ static int mongofs_release(const char* path, struct fuse_file_info_t* fi) {
    int exit_status = get_cached(parsed.id, true, &cached);
    if (exit_status != 0) return exit_status;
 
+   bool flush_from_cache = true;
+
    if (cached->dirty) {
       // write to mongoc driver
       MONGOFS_DEBUG("cached doc is dirty, attempting to write\n");
+      // attempt to create bson.
+      bson_t bson;
+      bson_error_t err;
+      if (bson_init_from_json(&bson, cached->data, cached->size, &err)) {
+         mongoc_collection_t* coll = mongoc_client_get_collection (client, "test", "coll");
+         bson_oid_t oid;
+         bson_oid_init_from_string (&oid, cached->id);
+
+         bson_t filter;
+         bson_init(&filter);
+         bson_append_oid(&filter, "_id", 3, &oid);
+
+         bool res = mongoc_collection_remove(coll, MONGOC_REMOVE_SINGLE_REMOVE, &filter, NULL, &err);
+         if (res) {
+            mongoc_collection_insert (coll, MONGOC_INSERT_NONE, &bson, NULL, &err);
+            // TODO: if this fails then we should probably re-insert the original.
+         } else {
+            flush_from_cache = false;
+         }
+      } else {
+         // Don't flush because user may wish to re-edit.
+         flush_from_cache = false;
+      }
    }
 
-   remove_if_cached(parsed.id);
+   if (flush_from_cache) remove_if_cached(parsed.id);
 }
 
 static struct fuse_operations mongofs_oper = {
