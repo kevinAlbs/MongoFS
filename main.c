@@ -18,6 +18,8 @@
 #include <fuse.h>
 #include <mongoc.h>
 
+#include "log.h"
+
 typedef struct {
    bool exists;
    bool is_bad;
@@ -35,6 +37,8 @@ mongoc_client_t* client;
 
 // number of documents to be shown in a directory. -1 for all
 static int batch_size = 1000;
+
+
 
 parsed_path_t parse_path(const char* path) {
    const char* path_iter = path;
@@ -307,6 +311,8 @@ static int mongofs_open(const char *path, struct fuse_file_info *fi)
 
    parsed_path_t parsed = parse_path(path);
 
+   MONGOFS_DEBUG("opening %s\n", path);
+
    if (parsed.is_bad || !parsed.exists)
       return -ENOENT;
 
@@ -422,6 +428,8 @@ static struct fuse_operations mongofs_oper = {
 int main(int argc, char *argv[])
 {
    mongoc_init();
+   init_log("../mongofs.log");
+   MONGOFS_LOG("test\n");
    init_cache();
    client = mongoc_client_new("mongodb://localhost:27017");
    printf("testing before fuse_main\n");
