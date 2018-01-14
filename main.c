@@ -35,15 +35,14 @@ enum log_type_t {LOG_INFO='I', LOG_WARNING='W', LOG_ERROR='E', LOG_DEBUG='D'};
 #define MONGOFS_ERROR(...) mongofs_log(LOG_ERROR, __VA_ARGS__)
 #define MONGOFS_DEBUG(...) mongofs_log(LOG_DEBUG, __VA_ARGS__)
 
-typedef struct _options {
+struct options_t {
    // Set with --tee
    bool tee; // whether or not to output logs to stdout/stderr as well as log file.
-   // Set with --log=<file path>
+   // Set with --log_file=<file path>
    FILE* log_file; // for fprintf
-
-} options_t;
-
-options_t opts;
+   // Set with --ns=<namespace string>
+   char namespace[120]; // See manual/reference/limits. Includes dot.
+} opts;
 
 void mongofs_log(enum log_type_t logtype, const char* format, ...) {
    // Prefix with time.
@@ -507,11 +506,49 @@ static struct fuse_operations mongofs_oper_single_file = {
 
 };
 
+void help()
+{
+   printf ("Usage: mongofs --ns=<namespace> [--tee] [--log_file=<path>]\n");
+}
+
 int main(int argc, char *argv[])
 {
-//   mongoc_init();
-   opts.log_file = fopen("../mongofs.log", "a");
-   printf("Logging output to ")
+   char* log_path="mongofs.log";
+   // Parse options.
+   opts.tee = 0;
+   opts.namespace[0] = '\0';
+   for (int i = 1; i < argc; i++) {
+      char* value;
+      if (value = strstr(argv[i], "--ns=")) {
+         value += 5;
+         if (strlen(value) > 120) {
+            fprintf(stderr, "namespace must be <= 120 chars\n");
+            exit(1);
+         }
+         strcpy(opts.namespace, value);
+      } else if (value = strstr(argv[i], "--log_file=")) {
+         value += 11;
+         log_path = value;
+      } else if (strcmp("--tee", argv[i]) == 0) {
+         opts.tee = 1;
+      } else if (strcmp("--help", argv[i]) == 0) {
+         help();
+         exit(0);
+      }
+   }
+
+   if (strlen(opts.namespace) == 0) {
+      help();
+      exit(1);
+   }
+
+   opts.log_file = fopen(log_path, "a");
+   printf("Mounting namespace '%s'\n", opts.namespace);
+   printf("Logging output to '%s'", log_path);
+   if (opts.tee) printf(" and stdout/stderr");
+   printf("\n");
+
+   mongoc_init();
 //   MONGOFS_LOG("test\n");
 //   init_cache();
 //   client = mongoc_client_new("mongodb://localhost:27017");
