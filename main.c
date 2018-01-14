@@ -18,7 +18,7 @@
 #include <fuse.h>
 #include <mongoc.h>
 
-#include "log.h"
+#include <time.h>
 
 typedef struct {
    bool exists;
@@ -28,8 +28,50 @@ typedef struct {
    int skips;
 } parsed_path_t;
 
-#define MONGOFS_DEBUG(...) printf(__VA_ARGS__)
+enum log_type_t {LOG_INFO='I', LOG_WARNING='W', LOG_ERROR='E', LOG_DEBUG='D'};
 
+#define MONGOFS_INFO(...) mongofs_log(LOG_INFO, __VA_ARGS__)
+#define MONGOFS_WARNING(...) mongofs_log(LOG_WARNING, __VA_ARGS__)
+#define MONGOFS_ERROR(...) mongofs_log(LOG_ERROR, __VA_ARGS__)
+#define MONGOFS_DEBUG(...) mongofs_log(LOG_DEBUG, __VA_ARGS__)
+
+typedef struct _options {
+   // Set with --tee
+   bool tee; // whether or not to output logs to stdout/stderr as well as log file.
+   // Set with --log=<file path>
+   FILE* log_file; // for fprintf
+
+} options_t;
+
+options_t opts;
+
+void mongofs_log(enum log_type_t logtype, const char* format, ...) {
+   // Prefix with time.
+   time_t now_time = time(NULL);
+   char* now_str = ctime(&now_time); // 26 chars including trailing \n + \0
+   struct tm* time = localtime(&now_time);
+   now_str[19] = '\0'; // remove year.
+   clock_t now_clock = clock();
+   if (CLOCKS_PER_SEC > 1000) {
+      now_clock /= (CLOCKS_PER_SEC / 1000); // should give ms.
+   }
+   now_clock = now_clock % 1000;
+   fprintf(opts.log_file, "[%c %s:%04d] ", logtype, now_str, now_clock);
+
+   FILE* stddes = logtype == LOG_ERROR ? stderr : stdout;
+   fprintf(stddes, "[%c %s:%04d] ", logtype, now_str, now_clock);
+
+   // Forward rest of args to printf.
+   va_list args, copy;
+   va_start(args, format);
+   va_copy(copy, args);
+   vfprintf (opts.log_file, format, args);
+   va_end(args);
+   va_start(copy, format);
+   vfprintf (stddes, format, args);
+   va_end(copy);
+
+}
 // fuse may run in multi-threaded mode.
 // TODO: I may need to (a) enforce single threaded or (b) use client_pool
 mongoc_client_t* client;
@@ -37,8 +79,6 @@ mongoc_client_t* client;
 
 // number of documents to be shown in a directory. -1 for all
 static int batch_size = 1000;
-
-
 
 parsed_path_t parse_path(const char* path) {
    const char* path_iter = path;
@@ -121,7 +161,8 @@ cleanup:
 
 typedef struct {
    bool free;
-   bool dirty;
+   bool dirty; /* if this file has been modified */
+   bool open; /* if this is a file that's been open'ed but not release'ed */
    char* data;
    int size;
    char id[24];
@@ -136,6 +177,7 @@ void init_cache() {
    }
 }
 
+// TODO: change id to id_str
 int get_cached(char* id, bool add_if_not_found, cached_bson_t** out) {
    MONGOFS_DEBUG("get_cached %s\n", id);
 
@@ -160,11 +202,37 @@ int get_cached(char* id, bool add_if_not_found, cached_bson_t** out) {
 
    if (i == 100) {
       MONGOFS_DEBUG("error, no free cache results");
-      return 0;
+      // Try to find something that we can free from the cache.
+      // First free items where open=false and dirty=false
+      // Then free items where open=false and dirty=true
+      // Otherwise, return error code.
+      for (i = 0; i < 100; i++) {
+         if (!cache[i].open && !cache[i].dirty) {
+            bson_free(cache[i].data);
+            cache[i].free = true;
+            break;
+         }
+      }
+
+      if (i == 100) {
+         for (i = 0; i < 100; i++) {
+            if (!cache[i].open && cache[i].dirty) {
+               bson_free(cache[i].data);
+               cache[i].free = true;
+               break;
+            }
+         }
+      }
+
+      if (i == 100) {
+         // return error.
+         return -EIO;
+      }
    }
 
    cache[i].free = false;
    cache[i].dirty = false;
+   cache[i].open = false;
    int exit_status  = get_bson_string(id, &cache[i].data, &cache[i].size);
    strncpy(cache[i].id, id, 24);
    if (exit_status != 0) return exit_status;
@@ -180,6 +248,7 @@ void remove_if_cached(char* id) {
       if (!cache[i].free && strncmp(cache[i].id, id, 24) == 0) {
          bson_free(cache[i].data);
          cache[i].free = true;
+         return;
       }
    }
    // no-op.
@@ -220,8 +289,7 @@ static int mongofs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
    // (void) offset;
    // (void) fi;
 
-   printf("readdir\n");
-   //return 0;
+   MONGOFS_INFO("readdir %s\n", path);
 
    filler(buf, ".", NULL, 0);
    filler(buf, "..", NULL, 0);
@@ -248,18 +316,17 @@ static int mongofs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
    
    while (mongoc_cursor_next(cursor, &doc)) {
       bson_iter_t iter;
-      if (bson_iter_init_find(&iter, doc, "_id")) {
+      if (bson_iter_init_find(&iter, doc, "_id") && BSON_ITER_HOLDS_OID(&iter)) {
          const bson_oid_t *oid = bson_iter_oid (&iter);
          bson_t tmp = BSON_INITIALIZER;
          bson_append_oid(&tmp, "", 0, oid);
-         // TODO: see if there is a better way to get object id as a string.
+         // TODO: is there a better way to get object id as a string.
          char* asStr = bson_as_json(&tmp, 0);
          asStr[19 + 24] = '\0';
-         // TODO: filler may return 1 if buf is full. Instead, change this to use the offset form
-         // of readdir so filled buffer won't break.
+         // Use the non-offset form of the directory filler (pass 0 as offset)
+         // for simplicity.
          int ret = filler(buf, asStr + 19, NULL, 0);
-         printf("adding %s\n", asStr + 19);
-         //bson_free(asStr);
+         bson_free(asStr);
          if (ret != 0) {
             exit_status = -EIO;
             goto cleanup;
@@ -269,6 +336,7 @@ static int mongofs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
    bson_error_t err;
    if (mongoc_cursor_error(cursor, &err)) {
+      MONGOFS_ERROR("error %s\n", err.message);
       exit_status = -EIO;
       goto cleanup;
    }
@@ -279,7 +347,6 @@ cleanup:
 
    return exit_status;
 }
-
 
 static int mongofs_truncate(const char *path, off_t offset) {
    MONGOFS_DEBUG("truncate %s", path);
@@ -305,6 +372,7 @@ static int mongofs_truncate(const char *path, off_t offset) {
    cached->size = offset;
    return 0;
 }
+
 static int mongofs_open(const char *path, struct fuse_file_info *fi)
 {
    // see `man 2 open` for flags
@@ -315,6 +383,12 @@ static int mongofs_open(const char *path, struct fuse_file_info *fi)
 
    if (parsed.is_bad || !parsed.exists)
       return -ENOENT;
+
+   cached_bson_t* cached;
+   int exit_status = get_cached(parsed.id, true, &cached);
+   if (exit_status != 0) return exit_status;
+
+   cached->open = true;
 
    // Can open file for writing
 //   if ((fi->flags & 3) != O_RDONLY)
@@ -382,6 +456,8 @@ static int mongofs_release(const char* path, struct fuse_file_info_t* fi) {
    int exit_status = get_cached(parsed.id, true, &cached);
    if (exit_status != 0) return exit_status;
 
+   cached->open = false;
+
    bool flush_from_cache = true;
 
    if (cached->dirty) {
@@ -407,7 +483,7 @@ static int mongofs_release(const char* path, struct fuse_file_info_t* fi) {
             flush_from_cache = false;
          }
       } else {
-         // Don't flush because user may wish to re-edit.
+         // Don't flush yet because user may reopen and edit.
          flush_from_cache = false;
       }
    }
@@ -415,6 +491,7 @@ static int mongofs_release(const char* path, struct fuse_file_info_t* fi) {
    if (flush_from_cache) remove_if_cached(parsed.id);
 }
 
+// Mode 1: separate file per doc.
 static struct fuse_operations mongofs_oper = {
    .getattr	= mongofs_getattr,
    .readdir	= mongofs_readdir,
@@ -425,14 +502,20 @@ static struct fuse_operations mongofs_oper = {
    .release = mongofs_release
 };
 
+// Mode 2: separate file per collection.
+static struct fuse_operations mongofs_oper_single_file = {
+
+};
+
 int main(int argc, char *argv[])
 {
-   mongoc_init();
-   init_log("../mongofs.log");
-   MONGOFS_LOG("test\n");
-   init_cache();
-   client = mongoc_client_new("mongodb://localhost:27017");
-   printf("testing before fuse_main\n");
-   return fuse_main(argc, argv, &mongofs_oper, NULL);
-
+//   mongoc_init();
+   opts.log_file = fopen("../mongofs.log", "a");
+   printf("Logging output to ")
+//   MONGOFS_LOG("test\n");
+//   init_cache();
+//   client = mongoc_client_new("mongodb://localhost:27017");
+//   printf("testing before fuse_main\n");
+//   return fuse_main(argc, argv, &mongofs_oper, NULL);
+   MONGOFS_INFO("this is a test");
 }
