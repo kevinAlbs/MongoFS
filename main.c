@@ -1,24 +1,14 @@
-/*
-  FUSE: Filesystem in Userspace
-  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
-
-  This program can be distributed under the terms of the GNU GPL.
-  See the file COPYING.
-
-  gcc -Wall hello.c `pkg-config fuse --cflags --libs` -o hello
-*/
-
 #define FUSE_USE_VERSION 26
 
-#include <stdio.h>
-#include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
 
 #include <fuse.h>
 #include <mongoc.h>
 
-#include <time.h>
 
 typedef struct {
    bool exists;
@@ -42,7 +32,10 @@ struct options_t {
    FILE* log_file; // for fprintf
    // Set with --ns=<namespace string>
    char namespace[120]; // See manual/reference/limits. Includes dot.
-} opts;
+   char* database;
+   char* collection;
+} cmd_opts;
+
 
 void mongofs_log(enum log_type_t logtype, const char* format, ...) {
    // Prefix with time.
@@ -55,21 +48,23 @@ void mongofs_log(enum log_type_t logtype, const char* format, ...) {
       now_clock /= (CLOCKS_PER_SEC / 1000); // should give ms.
    }
    now_clock = now_clock % 1000;
-   fprintf(opts.log_file, "[%c %s:%04d] ", logtype, now_str, now_clock);
+   fprintf(cmd_opts.log_file, "[%c %s:%04lu] ", logtype, now_str, now_clock);
 
    FILE* stddes = logtype == LOG_ERROR ? stderr : stdout;
-   fprintf(stddes, "[%c %s:%04d] ", logtype, now_str, now_clock);
+   fprintf(stddes, "[%c %s:%04lu] ", logtype, now_str, now_clock);
 
    // Forward rest of args to printf.
    va_list args, copy;
    va_start(args, format);
    va_copy(copy, args);
-   vfprintf (opts.log_file, format, args);
+   vfprintf (cmd_opts.log_file, format, args);
    va_end(args);
    va_start(copy, format);
-   vfprintf (stddes, format, args);
+   vfprintf (stddes, format, copy);
    va_end(copy);
 
+   fprintf(cmd_opts.log_file, "\n");
+   fprintf(stddes, "\n");
 }
 // fuse may run in multi-threaded mode.
 // TODO: I may need to (a) enforce single threaded or (b) use client_pool
@@ -82,7 +77,7 @@ static int batch_size = 1000;
 parsed_path_t parse_path(const char* path) {
    const char* path_iter = path;
    parsed_path_t parsed = {0};
-   while (strstr(path_iter, "/it") != NULL) {
+   while (strncmp(path_iter, "/it", 3) == 0) {
       parsed.skips++;
       path_iter += 3;
    }
@@ -113,7 +108,7 @@ parsed_path_t parse_path(const char* path) {
 int get_bson_string(const char* id, char** out, int* outlen) {
    int exit_status = 0;
    if (!bson_oid_is_valid(id, 24)) {
-      printf("malformed oid\n");
+      MONGOFS_ERROR("malformed oid %s", id);
       return -ENOENT;
    }
 
@@ -129,7 +124,7 @@ int get_bson_string(const char* id, char** out, int* outlen) {
    bson_t opts;
    bson_init(&opts);
 
-   mongoc_collection_t* coll = mongoc_client_get_collection (client, "test", "coll");
+   mongoc_collection_t* coll = mongoc_client_get_collection (client, cmd_opts.database, cmd_opts.collection);
    mongoc_cursor_t* cursor = mongoc_collection_find_with_opts (coll, &query, &opts, NULL);
 
    bson_destroy (&query);
@@ -146,7 +141,7 @@ int get_bson_string(const char* id, char** out, int* outlen) {
       goto cleanup;
    }
    else {
-      printf("doc with id %s not found\n", id);
+      MONGOFS_WARNING("doc with id %s not found", id);
       exit_status = -ENOENT;
       goto cleanup;
    }
@@ -176,9 +171,8 @@ void init_cache() {
    }
 }
 
-// TODO: change id to id_str
 int get_cached(char* id, bool add_if_not_found, cached_bson_t** out) {
-   MONGOFS_DEBUG("get_cached %s\n", id);
+   MONGOFS_DEBUG("get_cached %s", id);
 
    *out = NULL;
 
@@ -200,7 +194,7 @@ int get_cached(char* id, bool add_if_not_found, cached_bson_t** out) {
    }
 
    if (i == 100) {
-      MONGOFS_DEBUG("error, no free cache results");
+      MONGOFS_ERROR("error, no free cache results");
       // Try to find something that we can free from the cache.
       // First free items where open=false and dirty=false
       // Then free items where open=false and dirty=true
@@ -240,7 +234,7 @@ int get_cached(char* id, bool add_if_not_found, cached_bson_t** out) {
 }
 
 void remove_if_cached(char* id) {
-   MONGOFS_DEBUG("remove_cached %s\n", id);
+   MONGOFS_DEBUG("remove_cached %s", id);
    // check if id is in cache
    int i;
    for (i = 0; i < 100; i++) {
@@ -250,21 +244,17 @@ void remove_if_cached(char* id) {
          return;
       }
    }
-   // no-op.
-   MONGOFS_DEBUG(" no-op");
 }
 
 static int mongofs_getattr(const char *path, struct stat *stbuf)
 {
-   MONGOFS_DEBUG("getattr %s \n", path);
+   MONGOFS_DEBUG("getattr %s", path);
    memset(stbuf, 0, sizeof(struct stat));
 
    parsed_path_t parsed = parse_path(path);
 
    if (parsed.is_bad || !parsed.exists)
       return -ENOENT;
-
-   // is marking .localized a directory causing a hang?
 
    if (parsed.is_dir) {
       stbuf->st_mode = S_IFDIR | 0755;
@@ -284,11 +274,7 @@ static int mongofs_getattr(const char *path, struct stat *stbuf)
 static int mongofs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                            off_t offset, struct fuse_file_info *fi)
 {
-   // TODO: why?
-   // (void) offset;
-   // (void) fi;
-
-   MONGOFS_INFO("readdir %s\n", path);
+   MONGOFS_INFO("readdir %s", path);
 
    filler(buf, ".", NULL, 0);
    filler(buf, "..", NULL, 0);
@@ -308,7 +294,7 @@ static int mongofs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
       "limit", BCON_INT32(batch_size),
       "projection", "{", "_id", BCON_INT32(1), "}");
 
-   mongoc_collection_t* coll = mongoc_client_get_collection (client, "test", "coll");
+   mongoc_collection_t* coll = mongoc_client_get_collection (client, cmd_opts.database, cmd_opts.collection);
    mongoc_cursor_t* cursor = mongoc_collection_find_with_opts(coll, &empty, opts, NULL );
 
    bson_free(opts);
@@ -375,10 +361,9 @@ static int mongofs_truncate(const char *path, off_t offset) {
 static int mongofs_open(const char *path, struct fuse_file_info *fi)
 {
    // see `man 2 open` for flags
-
    parsed_path_t parsed = parse_path(path);
 
-   MONGOFS_DEBUG("opening %s\n", path);
+   MONGOFS_DEBUG("opening %s", path);
 
    if (parsed.is_bad || !parsed.exists)
       return -ENOENT;
@@ -389,13 +374,9 @@ static int mongofs_open(const char *path, struct fuse_file_info *fi)
 
    cached->open = true;
 
-   // Can open file for writing
-//   if ((fi->flags & 3) != O_RDONLY)
-//      return -EACCES;
-
    // return a file descriptor.
    // TODO: use fd to keep track of which bson_t's to cache in memory
-   fi->fh = 10;
+   fi->fh = 123;
    return 0;
 }
 
@@ -404,11 +385,8 @@ static int mongofs_open(const char *path, struct fuse_file_info *fi)
 static int mongofs_read(const char *path, char *buf, size_t size, off_t offset,
                       struct fuse_file_info *fi)
 {
-   MONGOFS_DEBUG("reading %s\n", path);
-   (void) fi;
-   // path should be of the form /it/it/it/....<id>
+   MONGOFS_DEBUG("reading %s", path);
    parsed_path_t parsed = parse_path(path);
-
    if (parsed.is_bad || !parsed.exists) return -ENOENT;
 
    cached_bson_t* cached;
@@ -417,19 +395,17 @@ static int mongofs_read(const char *path, char *buf, size_t size, off_t offset,
 
    int bytes_to_copy = size;
    if (offset + size > cached->size) {
-      // this is the last read.
+      // This is the last read.
       bytes_to_copy = cached->size - offset; // might be zero
    }
    memcpy(buf, cached->data + offset, bytes_to_copy);
    return bytes_to_copy;
 }
 
-static int mongofs_write(const char *path, const char* data, size_t size, off_t offset, struct fuse_file_info_t* fi) {
-   MONGOFS_DEBUG("writing %s\n", path);
+static int mongofs_write(const char *path, const char* data, size_t size, off_t offset, struct fuse_file_info* fi) {
+   MONGOFS_DEBUG("writing %s", path);
    parsed_path_t parsed = parse_path(path);
-   if (parsed.is_bad || !parsed.exists) {
-      return -ENOENT;
-   }
+   if (parsed.is_bad || !parsed.exists) return -ENOENT;
 
    cached_bson_t* cached;
    int exit_status = get_cached(parsed.id, true, &cached);
@@ -441,12 +417,11 @@ static int mongofs_write(const char *path, const char* data, size_t size, off_t 
    }
 
    memcpy(cached->data + offset, data, size);
-
    return size;
 }
 
-static int mongofs_release(const char* path, struct fuse_file_info_t* fi) {
-   MONGOFS_DEBUG("mongofs_release %s\n", path);
+static int mongofs_release(const char* path, struct fuse_file_info* fi) {
+   MONGOFS_DEBUG("mongofs_release %s", path);
    parsed_path_t parsed = parse_path(path);
 
    if (parsed.is_bad || !parsed.exists) return -ENOENT;
@@ -466,7 +441,7 @@ static int mongofs_release(const char* path, struct fuse_file_info_t* fi) {
       bson_t bson;
       bson_error_t err;
       if (bson_init_from_json(&bson, cached->data, cached->size, &err)) {
-         mongoc_collection_t* coll = mongoc_client_get_collection (client, "test", "coll");
+         mongoc_collection_t* coll = mongoc_client_get_collection (client, cmd_opts.database, cmd_opts.collection);
          bson_oid_t oid;
          bson_oid_init_from_string (&oid, cached->id);
 
@@ -488,6 +463,7 @@ static int mongofs_release(const char* path, struct fuse_file_info_t* fi) {
    }
 
    if (flush_from_cache) remove_if_cached(parsed.id);
+   return 0;
 }
 
 // Mode 1: separate file per doc.
@@ -501,58 +477,87 @@ static struct fuse_operations mongofs_oper = {
    .release = mongofs_release
 };
 
-// Mode 2: separate file per collection.
-static struct fuse_operations mongofs_oper_single_file = {
-
-};
+// TODO Mode 2: separate file per collection.
+static struct fuse_operations mongofs_oper_single_file = {};
 
 void help()
 {
-   printf ("Usage: mongofs --ns=<namespace> [--tee] [--log_file=<path>]\n");
+   printf ("Usage: mongofs --ns=<namespace> [--uri=<mongo uri>] [--tee] [--log_file=<path>] <fuse options>\n");
+   printf ("  By default uses --uri=mongodb://localhost:27017\n");
 }
 
 int main(int argc, char *argv[])
 {
-   char* log_path="mongofs.log";
+   char* uri = "mongodb://localhost:27017";
+   char* log_path = "mongofs.log";
+
    // Parse options.
-   opts.tee = 0;
-   opts.namespace[0] = '\0';
-   for (int i = 1; i < argc; i++) {
+   cmd_opts.tee = 0;
+   cmd_opts.namespace[0] = '\0';
+
+   char* fuse_argv[64];
+   int fuse_argc = 1;
+   fuse_argv[0] = argv[0];
+
+   int i;
+   for (i = 1; i < argc; i++) {
       char* value;
-      if (value = strstr(argv[i], "--ns=")) {
+      if ((value = strstr(argv[i], "--ns="))) {
          value += 5;
          if (strlen(value) > 120) {
             fprintf(stderr, "namespace must be <= 120 chars\n");
             exit(1);
          }
-         strcpy(opts.namespace, value);
-      } else if (value = strstr(argv[i], "--log_file=")) {
+         strcpy(cmd_opts.namespace, value);
+      } else if ((value = strstr(argv[i], "--log_file="))) {
          value += 11;
          log_path = value;
       } else if (strcmp("--tee", argv[i]) == 0) {
-         opts.tee = 1;
+         cmd_opts.tee = 1;
       } else if (strcmp("--help", argv[i]) == 0) {
          help();
          exit(0);
+      } else if ((value = strstr(argv[i], "--uri="))) {
+         uri = value + 6;
+      } else {
+         break; // break on first unrecognized arg.
       }
    }
 
-   if (strlen(opts.namespace) == 0) {
+   for (; i < argc; i++) {
+      fuse_argv[fuse_argc] = argv[i];
+      fuse_argc++;
+   }
+
+   if (strlen(cmd_opts.namespace) == 0) {
       help();
       exit(1);
    }
 
-   opts.log_file = fopen(log_path, "a");
-   printf("Mounting namespace '%s'\n", opts.namespace);
+   // Determine database/collection.
+   cmd_opts.database = cmd_opts.namespace;
+   cmd_opts.collection = NULL;
+   for (int i = 0; i < 120; i++) {
+      if (cmd_opts.namespace[i] == '\0') break;
+      if (cmd_opts.namespace[i] == '.') {
+         cmd_opts.namespace[i] = '\0';
+         cmd_opts.collection = cmd_opts.namespace + i + 1;
+      }
+   }
+
+   if (cmd_opts.collection == NULL) {
+      printf("Bad namespace %s\n", cmd_opts.namespace);
+      exit(1);
+   }
+
+   cmd_opts.log_file = fopen(log_path, "a");
+   printf("Mounting namespace '%s'\n", cmd_opts.namespace);
    printf("Logging output to '%s'", log_path);
-   if (opts.tee) printf(" and stdout/stderr");
+   if (cmd_opts.tee) printf(" and stdout/stderr");
    printf("\n");
 
    mongoc_init();
-//   MONGOFS_LOG("test\n");
-//   init_cache();
-//   client = mongoc_client_new("mongodb://localhost:27017");
-//   printf("testing before fuse_main\n");
-//   return fuse_main(argc, argv, &mongofs_oper, NULL);
-   MONGOFS_INFO("this is a test");
+   init_cache();
+   client = mongoc_client_new(uri);
+   return fuse_main(fuse_argc, fuse_argv, &mongofs_oper, NULL);
 }
